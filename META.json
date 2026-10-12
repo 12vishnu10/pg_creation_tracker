@@ -1,0 +1,21 @@
+{
+   "name": "pg_creation_tracker",
+   "abstract": "Automated PostgreSQL database and table creation timestamp tracker",
+   "description": "Captures live table creations via DDL event triggers, backfills existing tables using catalog and storage forensics, and tracks database creation timestamps across standard and custom tablespaces.",
+   "version": "1.0.0",
+   "maintainer": [
+      "Your Name <your.email@example.com>"
+   ],
+   "license": "postgresql",
+   "provides": {
+      "pg_creation_tracker": {
+         "abstract": "Automated PostgreSQL database and table creation audit",
+         "file": "pg_creation_tracker--1.0.sql",
+         "version": "1.0.0"
+      }
+   },
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   }
+}

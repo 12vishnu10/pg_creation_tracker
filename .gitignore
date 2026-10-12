@@ -1,0 +1,7 @@
+*.tar.gz
+*.rpm
+*.zip
+*.o
+*.so
+.DS_Store
+build/

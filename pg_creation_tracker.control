@@ -1,0 +1,5 @@
+# pg_creation_tracker extension
+comment = 'Tracks PostgreSQL database table creation timestamps'
+default_version = '1.0'
+relocatable = false
+schema = 'timestamp_tracking'
