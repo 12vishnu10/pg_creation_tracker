@@ -1,0 +1,9 @@
+# pg_track extension
+comment = 'Automated PostgreSQL database, schema, table, and index creation tracker'
+default_version = '1.0'
+relocatable = false
+schema = 'track'
+
+
+
+
