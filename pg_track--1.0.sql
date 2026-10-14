@@ -1,3 +1,4 @@
+cat << 'EOF' > /root/pg_creation_tracker/pg_track--1.0.sql
 -- Enforce extension execution
 \echo Use "CREATE EXTENSION pg_track" to load this file. \quit
 
@@ -23,32 +24,45 @@ AS $$
 DECLARE
     v_path text;
     v_stat record;
+    v_ver_dir text;
 BEGIN
-    -- If default tablespace (pg_default, oid 1663 or 0), inspect base/<db_oid>/PG_VERSION
-    IF p_spc_oid = 1663 OR p_spc_oid = 0 THEN
+    -- 1. Default tablespaces (pg_default = 1663 or pg_global = 1664 or 0)
+    IF p_spc_oid = 1663 OR p_spc_oid = 1664 OR p_spc_oid = 0 THEN
         v_path := 'base/' || p_db_oid || '/PG_VERSION';
     ELSE
-        -- Custom tablespace: inspect PG_VERSION inside tablespace directory
+        -- 2. Custom tablespace: resolve pg_tblspc version directory
         BEGIN
-            SELECT 'pg_tblspc/' || p_spc_oid || '/' || pg_tablespace_location(p_spc_oid) || '/' || p_db_oid || '/PG_VERSION'
-            INTO v_path;
+            SELECT entry INTO v_ver_dir
+            FROM pg_ls_dir('pg_tblspc/' || p_spc_oid) entry
+            WHERE entry LIKE 'PG_%'
+            LIMIT 1;
+
+            IF v_ver_dir IS NOT NULL THEN
+                v_path := 'pg_tblspc/' || p_spc_oid || '/' || v_ver_dir || '/' || p_db_oid || '/PG_VERSION';
+            ELSE
+                v_path := 'base/' || p_db_oid || '/PG_VERSION';
+            END IF;
         EXCEPTION WHEN OTHERS THEN
             v_path := 'base/' || p_db_oid || '/PG_VERSION';
-        END IF;
+        END;
     END IF;
 
-    -- Attempt 1: Read modification time of PG_VERSION (matches creation/birth time permanently)
+    -- Attempt 1: Read modification time of PG_VERSION
     BEGIN
         SELECT modification INTO v_stat FROM pg_stat_file(v_path);
+        IF v_stat IS NOT NULL THEN
+            RETURN v_stat.modification;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        NULL;
+    END;
+
+    -- Attempt 2: Fallback to base directory
+    BEGIN
+        SELECT modification INTO v_stat FROM pg_stat_file('base/' || p_db_oid);
         RETURN v_stat.modification;
     EXCEPTION WHEN OTHERS THEN
-        -- Fallback: check database directory itself if PG_VERSION is inaccessible
-        BEGIN
-            SELECT modification INTO v_stat FROM pg_stat_file('base/' || p_db_oid);
-            RETURN v_stat.modification;
-        EXCEPTION WHEN OTHERS THEN
-            RETURN NULL;
-        END;
+        RETURN NULL;
     END;
 END;
 $$;
@@ -304,3 +318,4 @@ SELECT backfill_existing_objects();
 CREATE EVENT TRIGGER capture_object_creation_trigger
 ON ddl_command_end
 EXECUTE FUNCTION capture_object_creation();
+EOF
