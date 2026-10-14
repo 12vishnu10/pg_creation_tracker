@@ -1,123 +1,222 @@
-# pg_creation_tracker
+## pg_track
 
-Automated PostgreSQL database and table creation timestamp tracker.
+`pg_track` is an automated PostgreSQL auditing and metadata extension that reliably captures creation timestamps for databases, schemas, tables, and indexes across an entire cluster.
 
-PostgreSQL system catalogs (`pg_class`, `pg_database`) do not natively maintain an object creation timestamp. `pg_creation_tracker` solves this limitation by providing:
-- **Live DDL Audit:** Captures real-time table creation timestamps via native Event Triggers.
-- **Forensic Historical Backfill:** Recovers creation timestamps for tables created prior to extension installation using commit logs, partition hierarchies, and storage metadata.
-- **Database Creation Auditing:** Tracks creation timestamps for all databases in the cluster across standard and custom tablespaces.
-- **Zero External Dependencies:** Pure SQL and PL/pgSQL. No C compiler or development headers required.
+It solves PostgreSQL's default limitation where object creation timestamps are not natively stored in system catalogs (`pg_class`, `pg_database`, `pg_namespace`).
+
+---
+
+## Key Features
+
+* **Cluster-Wide Database Creation Tracking:** Identifies exact creation timestamps for all databases by reading underlying filesystem metadata (`PG_VERSION`) across default and custom tablespaces.
+* **Real-Time DDL Audit via Event Triggers:** Captures tables, partitioned tables, foreign tables, schemas, and indexes as soon as they are executed.
+* **Historical Backfill Engine:** Evaluates existing pre-extension relations using commit log transactions (`track_commit_timestamp`), partition hierarchies, and relation filenode creation estimates.
+* **Clean Namespace Isolation:** All tables, helper functions, and audit views are sequestered under the `track` schema (`track.tables`, `track.schemas`, `track.indexes`, `track.databases`).
+* **Cluster Inheritance Ready:** Integrates cleanly with `template1` to automatically enable tracking on all newly provisioned databases.
+
+---
+
+## Architecture & Detection Methods
+
+| Method | Description | Target Scope |
+| :--- | :--- | :--- |
+| `EVENT_TRIGGER` | Real-time DDL capture via `ddl_command_end` event triggers. | New tables, indexes, and schemas |
+| `FILESYSTEM_PG_VERSION_METADATA` | Inspects creation/birth timestamps of `$PGDATA/base/<db_oid>/PG_VERSION` or `pg_tblspc/<spc_oid>/<version>/<db_oid>/PG_VERSION`. | Databases (default & custom tablespaces) |
+| `COMMIT_TIMESTAMP` | Retrieved via `pg_xact_commit_timestamp(xmin)` when `track_commit_timestamp = on`. | Existing pre-install objects |
+| `PARTITION_EARLIEST_CHILD_ESTIMATE` | Earliest storage creation time derived from constituent child partitions. | Partitioned tables & indexes |
+| `FILESYSTEM_UNMODIFIED` | Storage modification time when relfilenode equals object OID. | Pre-existing relations |
+| `REWRITTEN_STORAGE_ESTIMATE` | Fallback timestamp estimate for relations rewritten via `VACUUM FULL` / `ALTER TABLE`. | Pre-existing relations |
 
 ---
 
 ## Installation
 
-### **Method 1: Pre-Built RPM (RHEL / Rocky / AlmaLinux)**
+### Prerequisites
 
-Download and install the binary package directly from GitHub Releases:
+* PostgreSQL 17
+* Optional (for improved backfill accuracy on legacy objects): `track_commit_timestamp = on` in `postgresql.conf`.
+
+### 1. Install via RPM (RHEL / Rocky / AlmaLinux 9/10)
+
+Download and install the pre-built binary package directly from the GitHub releases page:
 
 ```bash
-sudo dnf install -y https://github.com/12vishnu10/pg_creation_tracker/releases/download/v1.0.0/pg_creation_tracker17-1.0-1.el10.noarch.rpm
+sudo dnf install -y https://github.com/12vishnu10/pg_track/releases/download/v1.0.0/pg_track17-1.0-2.el10.noarch.rpm
 ```
 
-## **Setup & Activation**
+### 2. Build and Install from Source
 
-### **1. Enable Cluster-Wide Inheritance (Recommended)**
+```bash
+git clone https://github.com/12vishnu10/pg_track.git
+cd pg_track
 
-To ensure every future database automatically starts with tracking enabled:
-
-```sql
-\c template1
-
-CREATE EXTENSION pg_creation_tracker;
+# Copy extension files directly into the PostgreSQL shared directory
+sudo cp pg_track.control /usr/pgsql-17/share/extension/
+sudo cp pg_track--1.0.sql /usr/pgsql-17/share/extension/
 ```
 
-Any subsequent `CREATE DATABASE my_new_db;` automatically inherits the audit tables and triggers.
+---
 
-### **2. Enable in an Existing Database**
+## Enabling the Extension
+
+### In an Existing Database
+
+Connect to your target database and run:
 
 ```sql
-\c my_existing_db
-
-CREATE EXTENSION pg_creation_tracker;
+CREATE EXTENSION pg_track;
 ```
 
-## How to Query Tracking Data
+Upon creation, `pg_track` automatically runs a backfill routine to catalog all existing schemas, tables, and indexes.
 
-### **1. View Table Creation Timestamps**
+---
 
-Use the following query to view recorded table creation timestamps, including the detection method used by the extension.
+## Automatic Cluster-Wide Propagation (`template1`)
+
+To ensure that **every future database** created on your cluster automatically includes `pg_track` with zero manual intervention, install the extension into `template1`:
+
+```bash
+sudo -u postgres psql -d template1 -c "CREATE EXTENSION IF NOT EXISTS pg_track;"
+```
+
+### How It Works
+
+Because PostgreSQL creates new databases by copying `template1` at the storage level:
+1. Every subsequent `CREATE DATABASE <name>;` command will inherit the `track` schema, views, and event triggers.
+2. The event trigger automatically begins tracking DDL in the new database immediately.
 
 ```sql
-SELECT
+-- Test propagation
+CREATE DATABASE analytics_app;
+\c analytics_app
+
+-- Verify the extension is already loaded
+\dx pg_track
+
+-- View pre-populated tracking
+SELECT * FROM track.tables;
+```
+
+---
+
+## Usage and Views Reference
+
+All monitoring views are queried under the `track` schema.
+
+### 1. Database Creation History (`track.databases`)
+
+Lists all databases in the cluster, their storage tablespace, and creation timestamp:
+
+```sql
+SELECT database_name, tablespace_name, creation_time, detection_method
+FROM track.databases
+ORDER BY creation_time DESC;
+```
+
+**Example Output:**
+
+```text
+ database_name | tablespace_name |         creation_time          |        detection_method        
+---------------+-----------------+--------------------------------+--------------------------------
+ cmd           | cmd_tbspc       | 2026-10-12 18:37:19.458921+00  | FILESYSTEM_PG_VERSION_METADATA
+ timestamp_lab | pg_default      | 2026-10-12 17:09:57.102341+00  | FILESYSTEM_PG_VERSION_METADATA
+ postgres      | pg_default      | 2026-09-07 17:31:06.000000+00  | FILESYSTEM_PG_VERSION_METADATA
+```
+
+### 2. Table Creation History (`track.tables`)
+
+Shows creation timestamps for regular, partitioned, and foreign tables:
+
+```sql
+SELECT schema_name, object_name, creation_time, detection_method
+FROM track.tables
+ORDER BY creation_time DESC;
+```
+
+### 3. Index Creation History (`track.indexes`)
+
+Displays creation timestamps for primary keys, secondary indexes, and partitioned indexes:
+
+```sql
+SELECT schema_name, object_name, creation_time, detection_method
+FROM track.indexes
+ORDER BY creation_time DESC;
+```
+
+### 4. Schema Creation History (`track.schemas`)
+
+Tracks user-created schemas:
+
+```sql
+SELECT schema_name, creation_time, detection_method
+FROM track.schemas
+ORDER BY creation_time DESC;
+```
+
+### 5. Master Audit Log (`track.objects`)
+
+Inspect the complete audit journal containing raw OIDs, registration timestamps, and object types:
+
+```sql
+SELECT 
     id,
+    object_type,
     schema_name,
     object_name,
     creation_time,
     recorded_time,
     detection_method
-FROM timestamp_tracking.object_creation_log
-ORDER BY id;
+FROM track.objects
+ORDER BY id DESC
+LIMIT 20;
 ```
 
-### **2. View Database Creation Timestamps**
+---
 
-Use the following query to view recorded database creation information.
+## Manual Backfill
+
+If historical objects were imported or restored using tools that bypass standard DDL triggers (e.g., low-level logical restores), you can trigger the backfill engine manually at any time:
 
 ```sql
-SELECT
-    database_oid,
-    database_name,
-    tablespace_name,
-    creation_time,
-    detection_method
-FROM timestamp_tracking.database_creation_info;
+SELECT track.backfill_existing_objects();
 ```
 
+---
 
+## Verification & Testing
 
-## Understanding the Audit Columns & Output
+Verify end-to-end event trigger capturing:
 
-### Columns in `timestamp_tracking.object_creation_log`
+```sql
+-- Create a schema, table, and index
+CREATE SCHEMA test_app;
+CREATE TABLE test_app.invoices (id bigint primary key, amount numeric);
+CREATE INDEX idx_invoices_amount ON test_app.invoices(amount);
 
-| Column               | Data Type   | Description                                                                         |
-| -------------------- | ----------- | ----------------------------------------------------------------------------------- |
-| **id**               | BIGINT      | Unique sequential identifier generated by the identity sequence.                    |
-| **database_name**    | TEXT        | Database where the table was created.                                               |
-| **schema_name**      | TEXT        | Schema containing the table (e.g., public, app, sales).                             |
-| **object_name**      | TEXT        | Fully-qualified name of the table (schema.table_name).                              |
-| **object_type**      | TEXT        | PostgreSQL relation classification (table, foreign table).                          |
-| **object_oid**       | OID         | Unique internal PostgreSQL catalog identifier assigned to the relation in pg_class. |
-| **creation_time**    | TIMESTAMPTZ | The inferred or captured timestamp when the object was actually created.            |
-| **recorded_time**    | TIMESTAMPTZ | The wall-clock instant when the tracking row was inserted into the log.             |
-| **detection_method** | TEXT        | Classification describing how the timestamp was acquired (see below).               |
+-- Check audit entries
+SELECT object_type, object_name, creation_time, detection_method
+FROM track.objects
+WHERE schema_name = 'test_app';
+```
 
-## Understanding detection_method Values
-
-Because PostgreSQL handles physical files differently during DDL operations, the extension explicitly labels where each timestamp was sourced:
-
-| Method                                | Accuracy        | What It Means                                                                                                                                                                                                                            |
-| ------------------------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **EVENT_TRIGGER**                     | **100% Exact**  | Table was created **after** the extension was active. The timestamp is captured directly from PostgreSQL's statement transaction start time (statement_timestamp()).                                                                     |
-| **COMMIT_TIMESTAMP**                  | **100% Exact**  | Table was created before the extension, but recovered via pg_xact_commit_timestamp(xmin) because transaction commit tracking was active on the cluster.                                                                                  |
-| **FILESYSTEM_UNMODIFIED**             | **High**        | Pre-existing table whose physical storage was **never rewritten** (relfilenode = oid). The timestamp reflects the physical file creation time on the storage disk.                                                                       |
-| **REWRITTEN_STORAGE_ESTIMATE**        | **Approximate** | Pre-existing table that underwent VACUUM FULL, CLUSTER, TRUNCATE, or ALTER TABLE table rewrites before the extension was installed. PostgreSQL replaced the original file with a new file; this timestamp shows the date of the rewrite. |
-| **PARTITION_EARLIEST_CHILD_ESTIMATE** | **High**        | Declarative partitioned parent tables (relkind = 'p') do not have physical relation files. The timestamp is calculated from the earliest physical child partition file.                                                                  |
-| **FILESYSTEM_DIRECTORY_METADATA**     | **High**        | Database creation timestamp extracted from the physical database cluster directory under base/ or pg_tblspc/.                                                                                                                            |
+---
 
 ## Uninstallation
 
-To remove tracking from a database:
+To remove `pg_track` from a database:
 
 ```sql
-DROP EXTENSION pg_creation_tracker CASCADE;
+DROP EXTENSION pg_track CASCADE;
 ```
 
-All event triggers, views, schemas, and historical logs for that database are cleanly removed.
+To remove the RPM from your operating system:
 
+```bash
+sudo dnf remove -y pg_track17
+```
 
+---
 
+## License
 
-
-
-
+This project is licensed under the [PostgreSQL License](LICENSE).
